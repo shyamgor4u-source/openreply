@@ -21,6 +21,12 @@
 FROM node:20-slim AS build
 WORKDIR /app
 
+# Prisma detects the OpenSSL version to pick its engine binaries; without
+# openssl on PATH, node:20-slim leaves it guessing.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssl \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY package.json package-lock.json ./
 RUN npm ci
 
