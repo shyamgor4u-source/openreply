@@ -1,0 +1,120 @@
+# OpenReply — production stack for a single VPS.
+#
+# Uploaded and started by .github/workflows/deploy.yml (via remote-deploy.sh).
+# Do not run it by hand without the .env that remote-deploy.sh assembles.
+#
+#   caddy    → HTTPS on 80/443, free Let's Encrypt cert, proxies to web
+#   web      → Next.js dashboard, OAuth callback, Meta webhook (runs migrations first)
+#   worker   → sends the DMs (BullMQ consumer)
+#   cron     → token refresh / next-reel / follower snapshots (scripts/cron.sh)
+#   postgres, redis → internal only, no published ports
+
+name: openreply
+
+x-app: &app
+  image: ${OPENREPLY_IMAGE:?OPENREPLY_IMAGE is not set}
+  restart: unless-stopped
+  env_file: .env
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: openreply
+      POSTGRES_USER: openreply
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openreply -d openreply"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # BullMQ requires noeviction; AOF so queued DMs survive a restart.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  web:
+    <<: *app
+    # Migrations need the database, so they run at start, never at build.
+    command: ["sh", "-c", "npx prisma migrate deploy && exec npm run start"]
+    healthcheck:
+      # Liveness only: any HTTP answer means Next is up. /api/health itself
+      # answers 503 while the worker is starting, which must not block caddy/cron.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(()=>process.exit(0),()=>process.exit(1))"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  worker:
+    <<: *app
+    command: ["npm", "run", "worker"]
+
+  cron:
+    <<: *app
+    command: ["sh", "scripts/cron.sh"]
+    environment:
+      CRON_BASE_URL: http://web:3000
+    depends_on:
+      web:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN is not set}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pgdata:
+  redisdata:
+  caddy_data:
+  caddy_config:
